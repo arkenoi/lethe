@@ -454,7 +454,8 @@ impl AnthropicOAuthClient {
         options: &ChatOptions,
     ) -> Result<ChatResponse> {
         let mut last_error = None;
-        for attempt in 0..3 {
+        let max_attempts = oauth_max_retries();
+        for attempt in 0..max_attempts {
             match self
                 .call_messages_once(model, request.clone(), options)
                 .await
@@ -462,11 +463,20 @@ impl AnthropicOAuthClient {
                 Ok(response) => return Ok(response),
                 Err(error @ AnthropicOAuthError::RateLimited { retry_after, .. }) => {
                     last_error = Some(error);
-                    tokio::time::sleep(retry_after).await;
+                    // claude.ai subscription 429s carry no `retry-after`, so
+                    // `retry_after` is the 30s header default. A fixed 30s x 3
+                    // gives up after 90s; the failure then surfaces to the
+                    // agent loop, which retries from the top and amplifies the
+                    // very limit we hit. Grow the wait exponentially (capped)
+                    // and extend the shared gate so a multi-minute spike is
+                    // ridden out here instead of fanning back out.
+                    let wait = oauth_backoff(retry_after, attempt);
+                    self.set_rate_limit(wait).await;
+                    tokio::time::sleep(wait).await;
                 }
                 Err(error @ AnthropicOAuthError::Transient { retry_after, .. }) => {
                     last_error = Some(error);
-                    let wait = retry_after.max(Duration::from_secs(5 * (attempt + 1) as u64));
+                    let wait = oauth_backoff(retry_after.max(Duration::from_secs(5)), attempt);
                     tokio::time::sleep(wait).await;
                 }
                 Err(error) => return Err(error.into()),
@@ -1187,6 +1197,34 @@ fn oauth_max_concurrency() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1)
         .max(1)
+}
+
+fn oauth_max_retries() -> usize {
+    env::var("LETHE_OAUTH_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1)
+}
+
+// Exponential backoff for OAuth rate-limit / transient retries: the base wait
+// doubles each attempt, capped by `LETHE_OAUTH_BACKOFF_CAP_SECS` (default
+// 120s). Subscription 429s carry no `retry-after`, so the base is typically the
+// 30s header default — growth lets a multi-minute window be ridden out inside
+// the client rather than surfacing to the agent loop and triggering a retry
+// storm. The cap bounds how long any single turn can block.
+fn oauth_backoff(base: Duration, attempt: usize) -> Duration {
+    let cap = env::var("LETHE_OAUTH_BACKOFF_CAP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .unwrap_or(120.0);
+    backoff_capped(base, attempt, cap)
+}
+
+fn backoff_capped(base: Duration, attempt: usize, cap_secs: f64) -> Duration {
+    let factor = 2f64.powi(attempt.min(16) as i32);
+    Duration::from_secs_f64((base.as_secs_f64() * factor).min(cap_secs))
 }
 
 fn unix_now_seconds() -> f64 {
@@ -2326,5 +2364,19 @@ mod tests {
             temperature_millidegrees: 500,
         };
         assert!(!should_use_openai_oauth(&config.model, &config));
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_then_caps() {
+        let base = Duration::from_secs(30);
+        let cap = 120.0;
+        assert_eq!(backoff_capped(base, 0, cap), Duration::from_secs(30));
+        assert_eq!(backoff_capped(base, 1, cap), Duration::from_secs(60));
+        assert_eq!(backoff_capped(base, 2, cap), Duration::from_secs(120));
+        // Past the cap, every further attempt is clamped (no overflow).
+        assert_eq!(backoff_capped(base, 3, cap), Duration::from_secs(120));
+        assert_eq!(backoff_capped(base, 99, cap), Duration::from_secs(120));
+        // A smaller base still grows from its own starting point.
+        assert_eq!(backoff_capped(Duration::from_secs(5), 2, cap), Duration::from_secs(20));
     }
 }
