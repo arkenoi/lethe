@@ -2,14 +2,20 @@
 
 Before any state-touching work, follow the SPAWN PROTOCOL (3 phases):
 - **Phase 0** — Write `{workspace}/acceptance_criteria/<task-name>_<YYYY-MM-DD>.md` BEFORE the first state-touching action. Binary pass/fail criteria, immutable once written. This applies whether you delegate to a subagent or do the work yourself.
-- **Phase 0.5 (multi-step tasks only)** — Write `{workspace}/plans/<task-name>_<YYYY-MM-DD>.md`: ordered step list, state-touch per step, dependencies, rollback. Plans recurse — any multi-step step gets its own sub-plan + sub-criteria. Depth is bounded (default max 3); every plan tree must contain at least one atomic-step leaf.
+- **Phase 0.5 (multi-step tasks only)** — Write `{workspace}/plans/<task-name>_<YYYY-MM-DD>.md`: ordered step list, state-touch per step, dependencies, rollback. For each step, note one failure mode: what could this step break that the task statement does not mention? Plans recurse — any multi-step step gets its own sub-plan + sub-criteria. Depth is bounded (default max 3); every plan tree must contain at least one atomic-step leaf. Before locking the plan, search `{workspace}/notes/` for lessons matching the task's keywords and cite any that apply.
 - **Phase 1** — Execute against the locked criteria (yourself or via spawned executor).
 - **Phase 2** — Independent verification: spawn a separate verifier that sees only the criteria + artifact paths, no executor reasoning. Verifier writes `{workspace}/verification_logs/<task-name>_<YYYY-MM-DD>.md` with per-criterion PASS/FAIL + concrete evidence.
 - Report "done" to the principal ONLY after the verification log exists AND the aggregate verdict is PASS.
 
 State-touching = external services (email, web, OAuth, third-party APIs), filesystem writes outside `{workspace}/notes/` and `{workspace}/ideas.md`, memory-block edits, payments, multi-step refactors. Internal scratch updates (dmn_state.md, questions.md, ideas.md) do not require criteria.
 
-If a task is genuinely contained (read a file, run a one-shot command, send a chat message), skip the formal phases — but the moment it expands to "let me also change X, Y, Z" you are in state-touching territory and Phase 0 applies.
+If a task is genuinely contained (read a file, run a one-shot command, send a chat message), skip the formal phases. Concrete rule: more than one file written, or more than one external call made, means the task is NOT contained — Phase 0 applies, no exceptions, and criteria written after the fact don't count.
+
+## Failure policy
+
+- Never retry a failed approach verbatim — same command, same goals string, same plan. One retry maximum, and only with a materially changed approach; state what changed.
+- If the retry fails too, stop and escalate to the user with a failure summary: what was tried, what failed (errors verbatim), what you would try next.
+- Rewriting a plan twice for the same task is escalation territory, not a third rewrite.
 
 ## Tools
 
